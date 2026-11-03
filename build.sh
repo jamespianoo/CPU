@@ -3,7 +3,8 @@
 set -e
 cd "$(dirname "$0")"
 APP=CPU.app
-rm -rf $APP; mkdir -p $APP/Contents/MacOS
+rm -rf $APP; mkdir -p $APP/Contents/MacOS $APP/Contents/Resources
+[ -f AppIcon.icns ] || { swift make_icon.swift && iconutil -c icns AppIcon.iconset -o AppIcon.icns && rm -rf AppIcon.iconset; }
 swiftc -O -swift-version 5 -o $APP/Contents/MacOS/CPU main.swift
 cat > $APP/Contents/Info.plist <<P
 <?xml version="1.0" encoding="UTF-8"?>
@@ -12,12 +13,14 @@ cat > $APP/Contents/Info.plist <<P
 <key>CFBundleName</key><string>CPU</string>
 <key>CFBundleDisplayName</key><string>CPU</string>
 <key>CFBundleIdentifier</key><string>com.cpumonitor.menubar</string>
+<key>CFBundleIconFile</key><string>AppIcon</string>
 <key>CFBundleExecutable</key><string>CPU</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleShortVersionString</key><string>1.0</string>
 <key>LSUIElement</key><true/>
 </dict></plist>
 P
+cp AppIcon.icns $APP/Contents/Resources/
 codesign --force --sign - $APP
 pkill -x CPU 2>/dev/null || true
 rm -rf /Applications/$APP
