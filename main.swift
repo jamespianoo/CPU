@@ -773,6 +773,7 @@ struct ContentView: View {
                   amount: String(format: "%.0f / %.0f GB used", m.diskUsedGB, m.diskTotalGB),
                   percent: String(format: "%.0f GB free", max(0, m.diskTotalGB - m.diskUsedGB)))
             Gauge(title: "GPU", value: m.gpu, usedColor: .teal, amount: m.gpuName, percent: String(format: "%.0f%%", m.gpu))
+            Divider().opacity(0.6)
             Picker("", selection: $sort) { ForEach(SortKey.allCases, id: \.self) { Text($0.rawValue).tag($0) } }
                 .pickerStyle(.segmented).labelsHidden()
             if sort == .disk {
