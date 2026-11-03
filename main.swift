@@ -23,6 +23,8 @@ struct SubRow: Identifiable {
     var pids: [Int32]
     var gpu: Double = 0
     var gpuTime: Double = 0
+    var readB: Double = 0
+    var writeB: Double = 0
 }
 
 struct AppRow: Identifiable {
@@ -32,9 +34,10 @@ struct AppRow: Identifiable {
     var memMB: Double = 0
     var subs: [SubRow] = []
     var bundlePath: String?
-    var diskMB: Double?
     var gpu: Double = 0
     var gpuTime: Double = 0
+    var readB: Double = 0
+    var writeB: Double = 0
     var isGUI = false
     var pids: [Int32] { subs.flatMap(\.pids) }
 }
@@ -65,8 +68,7 @@ final class Monitor: ObservableObject {
     let effCores = Monitor.sysctlInt("hw.perflevel1.physicalcpu")
 
     private var prevTicks: [UInt32]?
-    private var diskCache: [String: Double] = [:]
-    private var pendingDisk: Set<String> = []
+    var ioByPid: [Int32: (r: Double, w: Double)] = [:]
     private var cwdCache: [Int32: String] = [:]
     private var pendingCwd: Set<Int32> = []
     private var timer: Timer?
@@ -92,7 +94,7 @@ final class Monitor: ObservableObject {
 
     func tick() {
         readCPU(); readRAM(); readDisk()
-        readNet(); readHeat(); readGPU()
+        readNet(); readHeat(); readGPU(); readDiskIO()
         onChange?()
         if detailed { refreshProcesses() }
     }
@@ -134,6 +136,40 @@ final class Monitor: ObservableObject {
         let used = Double(total) - Double(free)
         diskTotalGB = Double(total) / 1e9; diskUsedGB = used / 1e9
         disk = used / Double(total) * 100
+    }
+
+    // MARK: disk activity (bytes read / written, like Activity Monitor)
+
+    @Published var diskReadRate: Double = 0
+    @Published var diskWriteRate: Double = 0
+    @Published var diskReadTotal: Double = 0
+    @Published var diskWriteTotal: Double = 0
+    private var prevDiskIO: (r: Double, w: Double, t: Date)?
+
+    private func readDiskIO() {
+        guard let m = IOServiceMatching("IOBlockStorageDriver") else { return }
+        var it: io_iterator_t = 0
+        guard IOServiceGetMatchingServices(kIOMainPortDefault, m, &it) == KERN_SUCCESS else { return }
+        defer { IOObjectRelease(it) }
+        var r = 0.0, w = 0.0
+        var s = IOIteratorNext(it)
+        while s != 0 {
+            var props: Unmanaged<CFMutableDictionary>?
+            if IORegistryEntryCreateCFProperties(s, &props, kCFAllocatorDefault, 0) == KERN_SUCCESS,
+               let d = props?.takeRetainedValue() as? [String: Any], let st = d["Statistics"] as? [String: Any] {
+                r += (st["Bytes (Read)"] as? NSNumber)?.doubleValue ?? 0
+                w += (st["Bytes (Write)"] as? NSNumber)?.doubleValue ?? 0
+            }
+            IOObjectRelease(s)
+            s = IOIteratorNext(it)
+        }
+        let now = Date()
+        if let p = prevDiskIO, r >= p.r, w >= p.w {
+            let dt = max(0.1, now.timeIntervalSince(p.t))
+            diskReadRate = (r - p.r) / dt; diskWriteRate = (w - p.w) / dt
+        }
+        diskReadTotal = r; diskWriteTotal = w
+        prevDiskIO = (r, w, now)
     }
 
     // MARK: network
@@ -372,7 +408,15 @@ final class Monitor: ObservableObject {
                 }
                 groups[a.name]?.subs.append(SubRow(id: "i\(root)", label: a.label, caption: caption, kind: 3, cpu: a.cpu, memMB: a.mem, pids: a.pids))
             }
-            DispatchQueue.main.async { MainActor.assumeIsolated { self.publish(groups); self.fetchCwd(needCwd) } }
+            var io: [Int32: (r: Double, w: Double)] = [:]
+            for pid in procs.keys {
+                var ri = rusage_info_v4()
+                let ok = withUnsafeMutablePointer(to: &ri) {
+                    $0.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { proc_pid_rusage(pid, RUSAGE_INFO_V4, $0) }
+                }
+                if ok == 0 { io[pid] = (Double(ri.ri_diskio_bytesread), Double(ri.ri_diskio_byteswritten)) }
+            }
+            DispatchQueue.main.async { MainActor.assumeIsolated { self.ioByPid = io; self.publish(groups); self.fetchCwd(needCwd) } }
         }
     }
 
@@ -500,7 +544,7 @@ final class Monitor: ObservableObject {
         for r in subs where r.kind == 2 { byLabel[r.label, default: []].append(r) }
         let total: ([SubRow]) -> Double = { $0.reduce(0) { $0 + $1.cpu } }
         for (l, rs) in byLabel.sorted(by: { total($0.value) > total($1.value) }) {
-            out.append(SubRow(id: "b" + l, label: rs.count > 1 ? "\(l) ×\(rs.count)" : l, kind: 2, cpu: total(rs), memMB: rs.reduce(0) { $0 + $1.memMB }, pids: rs.flatMap(\.pids), gpu: rs.reduce(0) { $0 + $1.gpu }, gpuTime: rs.reduce(0) { $0 + $1.gpuTime }))
+            out.append(SubRow(id: "b" + l, label: rs.count > 1 ? "\(l) ×\(rs.count)" : l, kind: 2, cpu: total(rs), memMB: rs.reduce(0) { $0 + $1.memMB }, pids: rs.flatMap(\.pids), gpu: rs.reduce(0) { $0 + $1.gpu }, gpuTime: rs.reduce(0) { $0 + $1.gpuTime }, readB: rs.reduce(0) { $0 + $1.readB }, writeB: rs.reduce(0) { $0 + $1.writeB }))
         }
         return out
     }
@@ -554,24 +598,17 @@ final class Monitor: ObservableObject {
                 rows[i].subs[j].gpu = rows[i].subs[j].pids.reduce(0) { $0 + (gpuByPid[$1] ?? 0) }
                 rows[i].subs[j].gpuTime = rows[i].subs[j].pids.reduce(0) { $0 + (gpuTimeByPid[$1] ?? 0) }
             }
+            for j in rows[i].subs.indices {
+                rows[i].subs[j].readB = rows[i].subs[j].pids.reduce(0) { $0 + (ioByPid[$1]?.r ?? 0) }
+                rows[i].subs[j].writeB = rows[i].subs[j].pids.reduce(0) { $0 + (ioByPid[$1]?.w ?? 0) }
+            }
+            rows[i].readB = rows[i].subs.reduce(0) { $0 + $1.readB }
+            rows[i].writeB = rows[i].subs.reduce(0) { $0 + $1.writeB }
             rows[i].gpu = rows[i].subs.reduce(0) { $0 + $1.gpu }
             rows[i].gpuTime = rows[i].subs.reduce(0) { $0 + $1.gpuTime }
             rows[i].subs = Monitor.collapse(rows[i].subs)
-            if let b = rows[i].bundlePath {
-                if let d = diskCache[b] { rows[i].diskMB = d } else { measure(b) }
-            }
         }
         self.rows = rows
-    }
-
-    private func measure(_ bundle: String) {
-        guard !pendingDisk.contains(bundle) else { return }
-        pendingDisk.insert(bundle)
-        DispatchQueue.global(qos: .background).async {
-            let s = Monitor.run("/usr/bin/du", ["-sk", bundle])
-            let kb = Double(s.split(whereSeparator: { $0 == "\t" || $0 == " " }).first ?? "") ?? 0
-            DispatchQueue.main.async { MainActor.assumeIsolated { self.diskCache[bundle] = kb / 1024 } }
-        }
     }
 
     func quit(app row: AppRow, force: Bool) {
@@ -601,6 +638,14 @@ func solid(_ alpha: CGFloat) -> Color {
 let ink = solid(1)
 let inkSoft = solid(0.88)
 
+func fmtBytes(_ b: Double) -> String {
+    if b >= 1e12 { return String(format: "%.2f TB", b / 1e12) }
+    if b >= 1e9 { return String(format: "%.2f GB", b / 1e9) }
+    if b >= 1e6 { return String(format: "%.1f MB", b / 1e6) }
+    if b >= 1e3 { return String(format: "%.0f KB", b / 1e3) }
+    return String(format: "%.0f B", b)
+}
+
 func rate(_ bps: Double) -> String {
     if bps >= 1e9 { return String(format: "%.1f GB/s", bps / 1e9) }
     if bps >= 1e6 { return String(format: "%.1f MB/s", bps / 1e6) }
@@ -611,7 +656,7 @@ func fmtMB(_ mb: Double) -> String { mb >= 1024 ? String(format: "%.1f GB", mb /
 
 struct Gauge: View {
     let title: String, value: Double, usedColor: Color, amount: String, percent: String
-    var selected = false
+    var showBar = true
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(alignment: .firstTextBaseline) {
@@ -621,12 +666,12 @@ struct Gauge: View {
                 Text(percent).font(.system(size: 14, weight: .bold, design: .rounded)).foregroundStyle(ink).monospacedDigit()
                     .frame(minWidth: 52, alignment: .trailing)
             }
-            GeometryReader { g in
+            if showBar { GeometryReader { g in
                 ZStack(alignment: .leading) {
                     Capsule().fill(solid(0.18))
                     Capsule().fill(value > 85 ? Color.red : usedColor).frame(width: max(6, g.size.width * min(max(value, 0), 100) / 100))
                 }
-            }.frame(height: 6)
+            }.frame(height: 6) }
         }
     }
 }
@@ -643,7 +688,7 @@ struct ContentView: View {
     }
 
     // MARK: per-app numbers for the selected tab: (amount, percent)
-    func figures(cpu: Double, mem: Double, disk: Double?, gpu: Double, gpuTime: Double) -> (String, String) {
+    func figures(cpu: Double, mem: Double, rw: (r: Double, w: Double), gpu: Double, gpuTime: Double) -> (String, String) {
         switch sort {
         case .gpu:
             return (gpuTime >= 60 ? String(format: "%.1f min", gpuTime / 60) : String(format: "%.1f s", gpuTime), String(format: "%.1f%%", gpu))
@@ -653,13 +698,13 @@ struct ContentView: View {
         case .ram:
             return (fmtMB(mem), String(format: "%.1f%%", mem / (m.ramTotalGB * 1024) * 100))
         default:
-            guard let d = disk, m.diskTotalGB > 0 else { return ("–", "–") }
-            return (fmtMB(d), String(format: "%.1f%%", d * 1_048_576 / (m.diskTotalGB * 1e9) * 100))
+            return (fmtBytes(rw.w), fmtBytes(rw.r))   // written, read
         }
     }
 
-    func shown(cpu: Double, mem: Double, gpu: Double) -> Bool {
+    func shown(cpu: Double, mem: Double, gpu: Double, rw: (r: Double, w: Double)) -> Bool {
         switch sort {
+        case .disk: return rw.r + rw.w >= 1e6
         case .gpu: return gpu >= 0.1
         case .cpu: return cpu / Double(m.cores) >= 0.1
         case .ram: return mem >= 10
@@ -668,9 +713,9 @@ struct ContentView: View {
     }
 
     func visibleSubs(_ r: AppRow) -> [SubRow] {
-        guard sort != .disk else { return [] }
-        let measured = r.subs.filter { $0.cpu >= 0 && shown(cpu: $0.cpu, mem: $0.memMB, gpu: $0.gpu) }.sorted {
+        let measured = r.subs.filter { $0.cpu >= 0 && shown(cpu: $0.cpu, mem: $0.memMB, gpu: $0.gpu, rw: ($0.readB, $0.writeB)) }.sorted {
             switch sort {
+            case .disk: return $0.writeB > $1.writeB
             case .ram: return $0.memMB > $1.memMB
             case .gpu: return $0.gpu > $1.gpu
             default: return $0.cpu > $1.cpu
@@ -680,10 +725,10 @@ struct ContentView: View {
     }
 
     var sorted: [AppRow] {
-        m.rows.filter { shown(cpu: $0.cpu, mem: $0.memMB, gpu: $0.gpu) && (sort != .disk || $0.diskMB != nil) }.sorted {
+        m.rows.filter { shown(cpu: $0.cpu, mem: $0.memMB, gpu: $0.gpu, rw: ($0.readB, $0.writeB)) }.sorted {
             switch sort {
             case .ram: return $0.memMB > $1.memMB
-            case .disk: return ($0.diskMB ?? -1) > ($1.diskMB ?? -1)
+            case .disk: return $0.writeB > $1.writeB
             case .gpu: return $0.gpu > $1.gpu
             default: return $0.cpu > $1.cpu
             }
@@ -724,11 +769,20 @@ struct ContentView: View {
                   amount: String(format: "%.1f / %d cores", m.cpu * Double(m.cores) / 100, m.cores), percent: String(format: "%.0f%%", m.cpu))
             Gauge(title: "Memory", value: m.ram, usedColor: .purple,
                   amount: String(format: "%.1f / %.0f GB", m.ramUsedGB, m.ramTotalGB), percent: String(format: "%.0f%%", m.ram))
-            Gauge(title: "Disk", value: m.disk, usedColor: .orange,
-                  amount: String(format: "%.0f / %.0f GB", m.diskUsedGB, m.diskTotalGB), percent: String(format: "%.0f%%", m.disk))
+            Gauge(title: "Disk", value: 0, usedColor: .orange,
+                  amount: "Read " + fmtBytes(m.diskReadTotal) + " · Written " + fmtBytes(m.diskWriteTotal),
+                  percent: rate(m.diskReadRate + m.diskWriteRate), showBar: false)
             Gauge(title: "GPU", value: m.gpu, usedColor: .teal, amount: m.gpuName, percent: String(format: "%.0f%%", m.gpu))
             Picker("", selection: $sort) { ForEach(SortKey.allCases, id: \.self) { Text($0.rawValue).tag($0) } }
                 .pickerStyle(.segmented).labelsHidden()
+            if sort == .disk {
+                HStack(spacing: 6) {
+                    Spacer()
+                    Text("Written").frame(width: 84, alignment: .trailing)
+                    Text("Read").frame(width: 80, alignment: .trailing)
+                    Color.clear.frame(width: 18)
+                }.font(.system(size: 11, weight: .bold, design: .rounded)).foregroundStyle(inkSoft).padding(.horizontal, 4)
+            }
             ScrollView {
                 LazyVStack(spacing: 0) {
                     switch sort {
@@ -752,7 +806,7 @@ struct ContentView: View {
 
     func appRow(_ r: AppRow) -> some View {
         let expandable = r.subs.count > 1 && !visibleSubs(r).isEmpty
-        let f = figures(cpu: r.cpu, mem: r.memMB, disk: r.diskMB, gpu: r.gpu, gpuTime: r.gpuTime)
+        let f = figures(cpu: r.cpu, mem: r.memMB, rw: (r.readB, r.writeB), gpu: r.gpu, gpuTime: r.gpuTime)
         return HStack(spacing: 6) {
             HStack(spacing: 6) {
                 Image(systemName: open.contains(r.id) ? "chevron.down" : "chevron.right")
@@ -763,14 +817,14 @@ struct ContentView: View {
             .contentShape(Rectangle())
             .onTapGesture { if expandable { if open.contains(r.id) { open.remove(r.id) } else { open.insert(r.id) } } }
             col(f.0, false, 14, 84)
-            col(f.1, true, 14, 62)
+            col(f.1, true, 14, 80)
             xButton(id: "a\(r.id)", help: "Quit \(r.name) (⌥ to force)") { m.quit(app: r, force: NSEvent.modifierFlags.contains(.option)) }
         }
         .padding(.vertical, 7).padding(.horizontal, 4)
     }
 
     func subRow(_ s: SubRow) -> some View {
-        let f = s.cpu < 0 ? ("–", "–") : figures(cpu: s.cpu, mem: s.memMB, disk: nil, gpu: s.gpu, gpuTime: s.gpuTime)
+        let f = s.cpu < 0 ? ("–", "–") : figures(cpu: s.cpu, mem: s.memMB, rw: (s.readB, s.writeB), gpu: s.gpu, gpuTime: s.gpuTime)
         return HStack(spacing: 6) {
             VStack(alignment: .leading, spacing: 1) {
                 Text(s.label).font(.system(size: 13, weight: s.kind == 0 ? .semibold : .medium, design: .rounded)).foregroundStyle(s.kind == 2 ? inkSoft : ink).lineLimit(1)
@@ -779,7 +833,7 @@ struct ContentView: View {
             .help(s.pids.map(String.init).joined(separator: ", "))
             Spacer(minLength: 4)
             col(f.0, false, 13, 84)
-            col(f.1, true, 13, 62)
+            col(f.1, true, 13, 80)
             xButton(id: s.id, help: "Quit (⌥ to force)") { m.quit(pids: s.pids, force: NSEvent.modifierFlags.contains(.option)) }
                 .opacity(s.pids.isEmpty ? 0 : 1).disabled(s.pids.isEmpty)
         }
