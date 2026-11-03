@@ -769,9 +769,9 @@ struct ContentView: View {
                   amount: String(format: "%.1f / %d cores", m.cpu * Double(m.cores) / 100, m.cores), percent: String(format: "%.0f%%", m.cpu))
             Gauge(title: "Memory", value: m.ram, usedColor: .purple,
                   amount: String(format: "%.1f / %.0f GB", m.ramUsedGB, m.ramTotalGB), percent: String(format: "%.0f%%", m.ram))
-            Gauge(title: "Disk", value: 0, usedColor: .orange,
-                  amount: "Read " + fmtBytes(m.diskReadTotal) + " · Written " + fmtBytes(m.diskWriteTotal),
-                  percent: rate(m.diskReadRate + m.diskWriteRate), showBar: false)
+            Gauge(title: "Disk", value: m.disk, usedColor: .orange,
+                  amount: String(format: "%.0f / %.0f GB used", m.diskUsedGB, m.diskTotalGB),
+                  percent: String(format: "%.0f GB free", max(0, m.diskTotalGB - m.diskUsedGB)))
             Gauge(title: "GPU", value: m.gpu, usedColor: .teal, amount: m.gpuName, percent: String(format: "%.0f%%", m.gpu))
             Picker("", selection: $sort) { ForEach(SortKey.allCases, id: \.self) { Text($0.rawValue).tag($0) } }
                 .pickerStyle(.segmented).labelsHidden()
