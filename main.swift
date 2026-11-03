@@ -214,6 +214,7 @@ final class Monitor: ObservableObject {
 
     @Published var gpu: Double = 0
     @Published var gpuName = "GPU"
+    @Published var gpuCores = 0
     @Published var gpuStats: [(String, String)] = []
     @Published var temps: [(String, Double)] = []
     @Published var heat: Double = 0
@@ -269,6 +270,7 @@ final class Monitor: ObservableObject {
                 func num(_ k: String) -> Double? { (ps[k] as? NSNumber)?.doubleValue }
                 gpu = num("Device Utilization %") ?? 0
                 gpuName = (d["model"] as? String) ?? "GPU"
+                gpuCores = (d["gpu-core-count"] as? NSNumber)?.intValue ?? 0
                 var out: [(String, String)] = []
                 if let c = (d["gpu-core-count"] as? NSNumber)?.intValue { out.append(("Cores", "\(c)")) }
                 if let v = num("Device Utilization %") { out.append(("Utilization", String(format: "%.0f%%", v))) }
@@ -691,7 +693,8 @@ struct ContentView: View {
     func figures(cpu: Double, mem: Double, rw: (r: Double, w: Double), gpu: Double, gpuTime: Double) -> (String, String) {
         switch sort {
         case .gpu:
-            return (gpuTime >= 60 ? String(format: "%.1f min", gpuTime / 60) : String(format: "%.1f s", gpuTime), String(format: "%.1f%%", gpu))
+            let cores = gpu / 100 * Double(max(m.gpuCores, 1))
+            return (String(format: m.gpuCores > 0 ? "%.2f cores" : "–", cores), String(format: "%.1f%%", gpu))
         case .cpu:
             let cores = cpu / 100
             return (cores >= 10 ? String(format: "%.0f cores", cores) : String(format: "%.2f cores", cores), String(format: "%.1f%%", cpu / Double(m.cores)))
@@ -772,7 +775,8 @@ struct ContentView: View {
             Gauge(title: "Disk", value: m.disk, usedColor: .orange,
                   amount: String(format: "%.0f / %.0f GB used", m.diskUsedGB, m.diskTotalGB),
                   percent: String(format: "%.0f GB free", max(0, m.diskTotalGB - m.diskUsedGB)))
-            Gauge(title: "GPU", value: m.gpu, usedColor: .teal, amount: m.gpuName, percent: String(format: "%.0f%%", m.gpu))
+            Gauge(title: "GPU", value: m.gpu, usedColor: .teal,
+                  amount: m.gpuCores > 0 ? String(format: "%.1f / %d cores", m.gpu / 100 * Double(m.gpuCores), m.gpuCores) : m.gpuName, percent: String(format: "%.0f%%", m.gpu))
             Divider().opacity(0.6)
             Picker("", selection: $sort) { ForEach(SortKey.allCases, id: \.self) { Text($0.rawValue).tag($0) } }
                 .pickerStyle(.segmented).labelsHidden()
