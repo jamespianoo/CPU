@@ -16,7 +16,7 @@ cat > $APP/Contents/Info.plist <<P
 <key>CFBundleIconFile</key><string>AppIcon</string>
 <key>CFBundleExecutable</key><string>CPU</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>1.0</string>
+<key>CFBundleShortVersionString</key><string>1.1.0</string>
 <key>LSUIElement</key><true/>
 </dict></plist>
 P
